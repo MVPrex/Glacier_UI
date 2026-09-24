@@ -373,7 +373,7 @@ def apply_colormap(normalized_data, valid_mask, cmap_name="Viridis"):
 # =========================================================
 def web_mercator_to_wgs84(x, y):
     lon = (x / 20037508.342789244) * 180.0
-    lat = (math.atan(math.exp((y / 20037508.342789244) * math.pi)) * 4.0 - math.pi) * (180.0 / math.pi)
+    lat = (2.0 * math.atan(math.exp((y / 20037508.342789244) * math.pi)) - math.pi / 2.0) * (180.0 / math.pi)
     return lat, lon
 
 
@@ -414,6 +414,38 @@ def utm_to_wgs84(easting, northing, zone, northern=True):
     return lat, lon
 
 
+def transform_point_to_wgs84(x, y, source_crs):
+    """Transform one x/y coordinate to WGS84, using common EPSG fallbacks if needed."""
+    x, y = float(x), float(y)
+    if HAS_PYPROJ:
+        transformer = Transformer.from_crs(
+            CRS.from_user_input(source_crs), CRS.from_epsg(4326), always_xy=True
+        )
+        lon, lat = transformer.transform(x, y, errcheck=True)
+        return float(lon), float(lat)
+
+    crs_text = re.sub(r"\s+", "", str(source_crs).upper())
+    if crs_text in ("EPSG:4326", "OGC:CRS84", "CRS84"):
+        return x, y
+    epsg_match = re.search(r"(?:EPSG[:/]+|^)(\d+)$", crs_text)
+    if not epsg_match:
+        raise ValueError(f"Unsupported CRS {source_crs}; reproject the file to EPSG:4326.")
+    epsg = int(epsg_match.group(1))
+    if epsg == 4326:
+        return x, y
+    if epsg == 3857:
+        lat, lon = web_mercator_to_wgs84(x, y)
+        return lon, lat
+    if 32601 <= epsg <= 32660 or 32701 <= epsg <= 32760:
+        zone = epsg % 100
+        northern = epsg < 32701
+        lat, lon = utm_to_wgs84(x, y, zone, northern)
+        return lon, lat
+    raise ValueError(
+        f"Cannot transform {source_crs} without PyProj. Reproject the file to EPSG:4326."
+    )
+
+
 def transform_bounds_to_wgs84(west, south, east, north, source_crs):
     """Transform a projected bounding box to WGS84 without guessing its CRS."""
     west, south, east, north = map(float, (west, south, east, north))
@@ -427,38 +459,33 @@ def transform_bounds_to_wgs84(west, south, east, north, source_crs):
         except Exception:
             pass
 
+    sample_count = 20
+    xs, ys = [], []
+    for index in range(sample_count + 1):
+        fraction = index / sample_count
+        x = west + (east - west) * fraction
+        y = south + (north - south) * fraction
+        xs.extend((x, x, west, east))
+        ys.extend((south, north, y, y))
     if HAS_PYPROJ:
         transformer = Transformer.from_crs(
             CRS.from_user_input(source_crs), CRS.from_epsg(4326), always_xy=True
         )
-        sample_count = 20
-        xs, ys = [], []
-        for index in range(sample_count + 1):
-            fraction = index / sample_count
-            x = west + (east - west) * fraction
-            y = south + (north - south) * fraction
-            xs.extend((x, x, west, east))
-            ys.extend((south, north, y, y))
         longitudes, latitudes = transformer.transform(xs, ys)
         points = [
             (float(lon), float(lat))
             for lon, lat in zip(longitudes, latitudes)
             if math.isfinite(float(lon)) and math.isfinite(float(lat))
         ]
-        if not points:
-            raise ValueError(f"Could not transform bounds from {source_crs} to EPSG:4326.")
-        return (
-            min(point[0] for point in points),
-            min(point[1] for point in points),
-            max(point[0] for point in points),
-            max(point[1] for point in points),
-        )
-
-    crs_text = str(source_crs).upper().replace(" ", "")
-    if crs_text in ("EPSG:4326", "OGC:CRS84"):
-        return west, south, east, north
-    raise ValueError(
-        f"Cannot transform {source_crs} coordinates: Rasterio/PyProj is unavailable. Install pyproj or rasterio."
+    else:
+        points = [transform_point_to_wgs84(x, y, source_crs) for x, y in zip(xs, ys)]
+    if not points:
+        raise ValueError(f"Could not transform bounds from {source_crs} to EPSG:4326.")
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
     )
 
 # =========================================================
@@ -711,11 +738,13 @@ def process_geojson(file_bytes, filename):
                 source_crs = None
             if not source_crs:
                 raise ValueError("GeoJSON declares a CRS that the app cannot read. Re-export it as EPSG:4326.")
-            if not HAS_PYPROJ:
-                raise ValueError("This GeoJSON declares a projected CRS; install pyproj to convert it to map coordinates.")
-            transformer = Transformer.from_crs(
-                CRS.from_user_input(source_crs), CRS.from_epsg(4326), always_xy=True
-            )
+            if HAS_PYPROJ:
+                source_crs = CRS.from_user_input(source_crs)
+                transformer = Transformer.from_crs(
+                    source_crs, CRS.from_epsg(4326), always_xy=True
+                )
+            else:
+                transform_point_to_wgs84(0, 0, source_crs)
 
         lats, lons = [], []
 
@@ -724,6 +753,8 @@ def process_geojson(file_bytes, filename):
                 x, y = float(node[0]), float(node[1])
                 if transformer is not None:
                     lon, lat = transformer.transform(x, y, errcheck=True)
+                elif declared_crs:
+                    lon, lat = transform_point_to_wgs84(x, y, source_crs)
                 else:
                     lon, lat = x, y
                 lon, lat = float(lon), float(lat)
