@@ -8,6 +8,13 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+try:
+    from pyproj import CRS, Transformer
+    HAS_PYPROJ = True
+except Exception:
+    CRS = None
+    Transformer = None
+    HAS_PYPROJ = False
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -427,33 +434,90 @@ def process_tiff_fallback(file_bytes, colormap_name="Viridis"):
         tiepoint_tag = tags.get(33922)
         geokey_tag = tags.get(34735)
 
-        epsg = 4326
+def transform_bounds_to_wgs84(west, south, east, north, source_crs):
+    """Transform a projected bounding box to WGS84 without guessing its CRS."""
+    west, south, east, north = map(float, (west, south, east, north))
+    if HAS_RASTERIO:
+        try:
+            transformed = transform_bounds(
+                source_crs, "EPSG:4326", west, south, east, north, densify_pts=21
+            )
+            if all(math.isfinite(float(value)) for value in transformed):
+                return tuple(float(value) for value in transformed)
+        except Exception:
+            pass
+
+    if HAS_PYPROJ:
+        transformer = Transformer.from_crs(
+            CRS.from_user_input(source_crs), CRS.from_epsg(4326), always_xy=True
+        )
+        sample_count = 20
+        xs, ys = [], []
+        for index in range(sample_count + 1):
+            fraction = index / sample_count
+            x = west + (east - west) * fraction
+            y = south + (north - south) * fraction
+            xs.extend((x, x, west, east))
+            ys.extend((south, north, y, y))
+        longitudes, latitudes = transformer.transform(xs, ys)
+        points = [
+            (float(lon), float(lat))
+            for lon, lat in zip(longitudes, latitudes)
+            if math.isfinite(float(lon)) and math.isfinite(float(lat))
+        ]
+        if not points:
+            raise ValueError(f"Could not transform bounds from {source_crs} to EPSG:4326.")
+        return (
+            min(point[0] for point in points),
+            min(point[1] for point in points),
+            max(point[0] for point in points),
+            max(point[1] for point in points),
+        )
+
+    crs_text = str(source_crs).upper().replace(" ", "")
+    if crs_text in ("EPSG:4326", "OGC:CRS84"):
+        return west, south, east, north
+    raise ValueError(
+        f"Cannot transform {source_crs} coordinates: Rasterio/PyProj is unavailable. Install pyproj or rasterio."
+    )
+
+
+        epsg = None
         if geokey_tag:
+            geographic_epsg = None
+            projected_epsg = None
             for i in range(0, len(geokey_tag) - 3, 4):
                 key_id = geokey_tag[i]
-                if key_id in (2048, 3072):
-                    epsg = geokey_tag[i + 3]
-                    break
+                code = int(geokey_tag[i + 3])
+                if code in (0, 32767):
+                    continue
+                if key_id == 2048:
+                    geographic_epsg = code
+                elif key_id == 3072:
+                    projected_epsg = code
+            epsg = projected_epsg or geographic_epsg
 
-        if scale_tag and tiepoint_tag and len(tiepoint_tag) >= 6:
-            min_x = float(tiepoint_tag[3])
-            max_y = float(tiepoint_tag[4])
-            max_x = min_x + orig_w * float(scale_tag[0])
-            min_y = max_y - orig_h * float(scale_tag[1])
+        if not (scale_tag and tiepoint_tag and len(tiepoint_tag) >= 6):
+            raise ValueError("GeoTIFF is missing georeferencing tags. Assign a CRS and export it as a georeferenced GeoTIFF.")
 
-            if epsg == 3857 or (abs(min_x) > 180 and abs(min_x) < 20037509):
-                south, west = web_mercator_to_wgs84(min_x, min_y)
-                north, east = web_mercator_to_wgs84(max_x, max_y)
-            elif (32601 <= epsg <= 32660) or (32701 <= epsg <= 32760) or (min_x > 100000 and max_y > 100000):
-                zone = (epsg % 100) if (32601 <= epsg <= 32760) else 18
-                is_north = epsg < 32701
-                south, west = utm_to_wgs84(min_x, min_y, zone, is_north)
-                north, east = utm_to_wgs84(max_x, max_y, zone, is_north)
+        x0 = float(tiepoint_tag[3])
+        y0 = float(tiepoint_tag[4])
+        x1 = x0 + orig_w * float(scale_tag[0])
+        y1 = y0 - orig_h * float(scale_tag[1])
+        left, right = sorted((x0, x1))
+        bottom, top = sorted((y0, y1))
+
+        if epsg is None:
+            if -180 <= left <= right <= 180 and -90 <= bottom <= top <= 90:
+                epsg = 4326
             else:
-                west, south, east, north = min_x, min_y, max_x, max_y
-        else:
-            west, south, east, north = -122.52, 37.70, -122.32, 37.84
+                raise ValueError("GeoTIFF coordinates are projected but the file has no usable EPSG code. Assign the correct CRS before upload.")
+        if epsg == 4326 and not (-180 <= left <= right <= 180 and -90 <= bottom <= top <= 90):
+            raise ValueError("GeoTIFF coordinates exceed WGS84 ranges but its CRS metadata says EPSG:4326. Check the file CRS.")
 
+        west, south, east, north = transform_bounds_to_wgs84(
+            left, bottom, right, top, f"EPSG:{epsg}"
+        )
         south = max(-85.0, min(85.0, float(south)))
         north = max(-85.0, min(85.0, float(north)))
         west = max(-180.0, min(180.0, float(west)))
@@ -627,36 +691,87 @@ def process_tiff(file_bytes, filename, colormap_name="Viridis"):
 # =========================================================
 @st.cache_data(show_spinner=False)
 def process_geojson(file_bytes, filename):
-    """Parses GeoJSON bytes into valid Python dictionary with bounds extraction."""
+    """Parse GeoJSON, reproject declared source CRS to WGS84, and compute bounds."""
     try:
         data = json.loads(file_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("GeoJSON root must be an object.")
+
+        declared_crs = data.get("crs")
+        transformer = None
+        if declared_crs:
+            if isinstance(declared_crs, str):
+                source_crs = declared_crs
+            elif isinstance(declared_crs, dict):
+                properties = declared_crs.get("properties", {}) or {}
+                source_crs = properties.get("name") or properties.get("href")
+                if not source_crs and properties.get("code"):
+                    authority = properties.get("authority") or "EPSG"
+                    source_crs = f"{authority}:{properties['code']}"
+            else:
+                source_crs = None
+            if not source_crs:
+                raise ValueError("GeoJSON declares a CRS that the app cannot read. Re-export it as EPSG:4326.")
+            if not HAS_PYPROJ:
+                raise ValueError("This GeoJSON declares a projected CRS; install pyproj to convert it to map coordinates.")
+            transformer = Transformer.from_crs(
+                CRS.from_user_input(source_crs), CRS.from_epsg(4326), always_xy=True
+            )
+
         lats, lons = [], []
 
-        def extract_coords(coords):
-            if not coords:
+        def normalize_coordinates(node):
+            if isinstance(node, list) and len(node) >= 2 and isinstance(node[0], (int, float)) and isinstance(node[1], (int, float)):
+                x, y = float(node[0]), float(node[1])
+                if transformer is not None:
+                    lon, lat = transformer.transform(x, y, errcheck=True)
+                else:
+                    lon, lat = x, y
+                lon, lat = float(lon), float(lat)
+                if not math.isfinite(lon) or not math.isfinite(lat):
+                    raise ValueError("GeoJSON contains non-finite coordinates.")
+                if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                    if transformer is None:
+                        raise ValueError("GeoJSON coordinates are outside WGS84 longitude/latitude ranges and no CRS is declared. Re-export as EPSG:4326 or include the source CRS.")
+                    raise ValueError("The declared GeoJSON CRS did not transform coordinates into valid WGS84 ranges. Check the CRS metadata.")
+                lons.append(lon)
+                lats.append(lat)
+                return [lon, lat, *node[2:]]
+            if isinstance(node, list):
+                return [normalize_coordinates(child) for child in node]
+            return node
+
+        def normalize_geometry(geometry):
+            if not isinstance(geometry, dict):
                 return
-            if isinstance(coords[0], (int, float)):
-                if len(coords) >= 2:
-                    lons.append(coords[0])
-                    lats.append(coords[1])
-            else:
-                for c in coords:
-                    extract_coords(c)
+            if "coordinates" in geometry:
+                geometry["coordinates"] = normalize_coordinates(geometry["coordinates"])
+            for child_geometry in geometry.get("geometries", []) or []:
+                normalize_geometry(child_geometry)
 
-        features = data.get("features", []) if isinstance(data, dict) else []
-        for feat in features:
-            geom = feat.get("geometry", {})
-            if geom:
-                extract_coords(geom.get("coordinates", []))
+        if data.get("type") == "FeatureCollection":
+            features = data.get("features", [])
+            if not isinstance(features, list):
+                raise ValueError("GeoJSON FeatureCollection.features must be an array.")
+        elif data.get("type") == "Feature":
+            features = [data]
+        elif data.get("type") in ("Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon", "GeometryCollection"): 
+            features = [{"geometry": data}]
+        else:
+            raise ValueError("Unsupported GeoJSON type. Use a Feature, FeatureCollection, or geometry.")
 
+        for feature in features:
+            if isinstance(feature, dict):
+                normalize_geometry(feature.get("geometry"))
+
+        if declared_crs:
+            data.pop("crs", None)
         bounds = None
         if lats and lons:
             bounds = [[min(lats), min(lons)], [max(lats), max(lons)]]
-
         return {"data": data, "bounds": bounds, "feature_count": len(features)}
     except Exception as e:
-        return {"error": f"GeoJSON parse error: {str(e)}"}
-
+        return {"error": f"GeoJSON parse/CRS error: {str(e)}"}
 
 # =========================================================
 # SAMPLE DATA GENERATOR (INSTANT DEMO)
