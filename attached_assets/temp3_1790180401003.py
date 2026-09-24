@@ -414,26 +414,6 @@ def utm_to_wgs84(easting, northing, zone, northern=True):
     return lat, lon
 
 
-# =========================================================
-# PURE-PYTHON GEOTIFF FALLBACK
-# =========================================================
-def process_tiff_fallback(file_bytes, colormap_name="Viridis"):
-    """Decodes TIFF via PIL when rasterio is unavailable, extracting tags and RGBA."""
-    try:
-        img = Image.open(io.BytesIO(file_bytes))
-        orig_w, orig_h = img.size
-
-        scale = min(PREVIEW_MAX_WIDTH / orig_w, PREVIEW_MAX_HEIGHT / orig_h, 1.0)
-        target_w = max(1, int(orig_w * scale))
-        target_h = max(1, int(orig_h * scale))
-
-        preview_img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
-
-        tags = getattr(img, "tag_v2", {})
-        scale_tag = tags.get(33550)
-        tiepoint_tag = tags.get(33922)
-        geokey_tag = tags.get(34735)
-
 def transform_bounds_to_wgs84(west, south, east, north, source_crs):
     """Transform a projected bounding box to WGS84 without guessing its CRS."""
     west, south, east, north = map(float, (west, south, east, north))
@@ -481,6 +461,25 @@ def transform_bounds_to_wgs84(west, south, east, north, source_crs):
         f"Cannot transform {source_crs} coordinates: Rasterio/PyProj is unavailable. Install pyproj or rasterio."
     )
 
+# =========================================================
+# PURE-PYTHON GEOTIFF FALLBACK
+# =========================================================
+def process_tiff_fallback(file_bytes, colormap_name="Viridis"):
+    """Decodes TIFF via PIL when rasterio is unavailable, extracting tags and RGBA."""
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        orig_w, orig_h = img.size
+
+        scale = min(PREVIEW_MAX_WIDTH / orig_w, PREVIEW_MAX_HEIGHT / orig_h, 1.0)
+        target_w = max(1, int(orig_w * scale))
+        target_h = max(1, int(orig_h * scale))
+
+        preview_img = img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+
+        tags = getattr(img, "tag_v2", {})
+        scale_tag = tags.get(33550)
+        tiepoint_tag = tags.get(33922)
+        geokey_tag = tags.get(34735)
 
         epsg = None
         if geokey_tag:
